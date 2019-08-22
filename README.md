@@ -1,2 +1,2 @@
 # mergetool
-批量merge工具，支持批量从src分支cherry-pick到dst分支
+git的批量merge工具，支持批量从src分支cherry-pick到dst分支，遇到冲突时，可以调起冲突解决工具，待冲突解决完毕，会接着merge剩余的条目直至所有条目都merge完成
