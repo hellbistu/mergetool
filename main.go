@@ -3,14 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/tealeg/xlsx"
 	"gopkg.in/src-d/go-git.v4"
-	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 )
 
@@ -20,26 +19,57 @@ func main() {
 	repoDir := os.Args[2]
 	srcBranch := os.Args[3]
 	dstBranch := os.Args[4]
-	excelFile := os.Args[5]
 
-	excelAbsPath := path.Join(repoDir, excelFile)
+	var mergeExcel  *xlsx.File = nil
+	var excelAbsPath string = ""
+	var err error = nil
 
-	mergeExcel, err := xlsx.OpenFile(excelAbsPath)
-	CheckIfError(err)
+	if opType!="getCommitLogs" {
+		//git commit logs是不需要打开merge.xlsx
+		excelFile := os.Args[5]
 
-	if opType == "getMergeList" {
+		excelAbsPath = path.Join(repoDir, excelFile)
+
+		_,err = os.Stat(excelAbsPath)
+		if err != nil {
+			mergeExcel = xlsx.NewFile()
+		} else {
+			mergeExcel, err = xlsx.OpenFile(excelAbsPath)
+			CheckIfError(err)
+		}
+	}
+
+	if opType == "getCommitLogs" {
+
 		r, err := git.PlainOpen(repoDir)
 		CheckIfError(err)
 
-		commitHistorys, err := getCommitLogs(r, srcBranch, dstBranch)
+		commitLogs, err := getCommitLogs(r, srcBranch, dstBranch)
 		CheckIfError(err)
 
-		allCommitItems, neetMergeItems := parseMergeContent(commitHistorys, mergeExcel)
+		saveCommitLogsToTmpExcel(commitLogs)
+	} else if opType == "getMergeList" {
+		r, err := git.PlainOpen(repoDir)
+		CheckIfError(err)
 
-		genMergeList(r, allCommitItems, neetMergeItems)
+		commitLogsExcel,err := xlsx.OpenFile(getTmpCommitLogsExcelPath())
+		CheckIfError(err)
+
+		//从src分支git log获取的所有最新的commit items
+		latestCommitItems, _ := loadCommitMsgFromExcel(commitLogsExcel)
+
+		//从merge.xlsx中获取到已经被merge到dst分支的commit items
+		_, mergedItems := loadCommitMsgFromExcel(mergeExcel)
+
+		//把已经Merge过的item填上merged time
+		fillMergedItems(latestCommitItems, mergedItems)
+
+		needMergeItems := getNeedMergeJiraIds(mergeExcel)
+
+		writeMergeListToStdout(r, latestCommitItems, needMergeItems)
 
 		//回填excel,把最新的commit logs填到sheet1
-		writeBackToExcel(mergeExcel, excelAbsPath, allCommitItems)
+		writeBackToExcel(mergeExcel, excelAbsPath, latestCommitItems)
 	} else if opType == "finishMerge" {
 
 		mergeList := os.Args[6]
@@ -51,43 +81,54 @@ func main() {
 		fillFinishMergeList(mergeHashs, commitItemsFromExcel)
 
 		writeBackToExcel(mergeExcel, excelAbsPath, commitItemsFromExcel)
-	} else if opType == "commitHashToMsg" {
-		commitItemsFromExcel, _ := loadCommitMsgFromExcel(mergeExcel)
-		commitHash := os.Args[6]
-		commitMsg := hashToCommitMsg(commitHash, commitItemsFromExcel)
-
-		//写回os.stdout里，merge的shell脚本会读取到
-		fmt.Fprintln(os.Stdout, commitMsg)
 	} else {
 		fmt.Fprintln(os.Stdout, "错误的操作类型")
 	}
 
 }
 
+func fillMergedItems(latestCommitItems []*MergeCommitItem, mergedItems map[string]*MergeCommitItem)  {
+	for _,commitItem := range latestCommitItems {
+		if mergedItem,ok := mergedItems[commitItem.commitHash]; ok {
+			commitItem.mergedTime = mergedItem.mergedTime
+		}
+	}
+}
+
+//获取PM整理的待合单子列表
+func getNeedMergeJiraIds(mergeExcelFile *xlsx.File) []string {
+	//所有的commit条目
+	needMergeItems := make([]string, 0)
+
+	if len(mergeExcelFile.Sheets) > 1 {
+		needMergeSheet := mergeExcelFile.Sheets[1]
+		for _, row := range needMergeSheet.Rows {
+			if len(row.Cells) < 1 {
+				continue
+			}
+			needMergeItems = append(needMergeItems, row.Cells[0].Value)
+		}
+	}
+
+	return needMergeItems
+}
+
+//把获取到的git logs保存在一个临时文件里
+func saveCommitLogsToTmpExcel(commitLogs []*MergeCommitItem)  {
+	tmpLogsExcel := xlsx.NewFile()
+
+	writeBackToExcel(tmpLogsExcel, getTmpCommitLogsExcelPath(), commitLogs)
+}
+
+func getTmpCommitLogsExcelPath() string {
+	tmpExcelPath,_ := filepath.Abs("TempCommitLogs.xlsx")
+	return tmpExcelPath
+}
+
 //获取src分支的提交记录
-func getCommitLogs(repository *git.Repository, srcBranch, dstBranch string) ([]*object.Commit, error) {
-	logs := make([]*object.Commit, 0)
-
-	w, err := repository.Worktree()
-	if err != nil {
-		return nil, err
-	}
-
-	//切到src分支之前先stash
-	stashCmd := exec.Command("git", "stash")
-	err = stashCmd.Run()
-	if err != nil {
-		return nil, err
-	}
-
-	//先切到src分支,抓到所有的提交日志
-	err = w.Checkout(&git.CheckoutOptions{
-		Branch: plumbing.NewBranchReferenceName(srcBranch),
-	})
-
-	if err != nil {
-		return nil, err
-	}
+func getCommitLogs(repository *git.Repository, srcBranch, dstBranch string) (allCommitItems []*MergeCommitItem, err error) {
+	//所有的commit条目
+	allCommitItems = make([]*MergeCommitItem, 0)
 
 	//指针移动到HEAD
 	ref, err := repository.Head()
@@ -102,50 +143,8 @@ func getCommitLogs(repository *git.Repository, srcBranch, dstBranch string) ([]*
 	}
 
 	//遍历
-	err = cIter.ForEach(func(c *object.Commit) error {
-		logs = append(logs, c)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	//抓取完src的提交日志，切换回dst分支，开始cherry-pick
-	err = w.Checkout(&git.CheckoutOptions{
-		Branch: plumbing.NewBranchReferenceName(dstBranch),
-		Force:  true,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	stashApplyCmd := exec.Command("git", "stash", "pop", "-q")
-	err = stashApplyCmd.Run()
-	if err != nil {
-		err = nil
-	}
-
-	return logs, err
-}
-
-//解析merge内容
-//allCommitItems 所有的提交记录
-//needMergeItems 由PM整理的本次需要合并的单子
-func parseMergeContent(commitLogs []*object.Commit, mergeExcelFile *xlsx.File) (allCommitItems []*MergeCommitItem, needMergeItems []string) {
-
-	//所有的commit条目
-	allCommitItems = make([]*MergeCommitItem, 0)
-	needMergeItems = make([]string, 0)
-
-	_, commitHashsFromExcel := loadCommitMsgFromExcel(mergeExcelFile)
-
-	for _, commitLogItem := range commitLogs {
-		commitHash := commitLogItem.Hash.String()[:7]
-		if commitItem, ok := commitHashsFromExcel[commitHash]; ok {
-			//之前已经在excel merge存档里的，跳过
-			allCommitItems = append(allCommitItems, commitItem)
-			continue
-		}
+	err = cIter.ForEach(func(commitLogItem *object.Commit) error {
+		//logs = append(logs, c)
 
 		commitItem := &MergeCommitItem{}
 		commitItem.commitHash = commitLogItem.Hash.String()[:7] //commit hash
@@ -156,21 +155,15 @@ func parseMergeContent(commitLogs []*object.Commit, mergeExcelFile *xlsx.File) (
 		commitItem.commitTime = commitLogItem.Committer.When.Format("2006-01-02 15:04:05")
 
 		allCommitItems = append(allCommitItems, commitItem)
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
-	if len(mergeExcelFile.Sheets) > 1 {
-		needMergeSheet := mergeExcelFile.Sheets[1]
-		for _, row := range needMergeSheet.Rows {
-			if len(row.Cells) < 1 {
-				continue
-			}
-			needMergeItems = append(needMergeItems, row.Cells[0].Value)
-		}
-	}
-
-	//merge的时候，需要按照提交顺序从 老的 到 新的 合并
-
-	return allCommitItems, needMergeItems
+	return allCommitItems, err
 }
 
 //从excel加载之前的commit log
@@ -200,10 +193,10 @@ func loadCommitMsgFromExcel(mergeExcelFile *xlsx.File) ([]*MergeCommitItem, map[
 	return commitItems, commitHashs
 }
 
-//开始合并
-func genMergeList(repository *git.Repository, allCommitItems []*MergeCommitItem, needMergeItems []string) error {
+//把需要merge的结果写到stdout里，这样执行merge的脚本就能获取到了
+func writeMergeListToStdout(repository *git.Repository, allCommitItems []*MergeCommitItem, needMergeItems []string) error {
 	var mergeList string = ""
-	//fmt.Fprintf(os.Stdout, "开始merge\n")
+
 	firstMergeHash := true
 	for i := len(allCommitItems) - 1; i >= 0; i-- {
 		commitItem := allCommitItems[i]
@@ -263,6 +256,10 @@ func writeBackToExcel(mergeExcelFile *xlsx.File, saveFilePath string, allCommitI
 			row.Cells[5].Value = commitItem.commitTime
 		}
 	}
+
+	if len(mergeExcelFile.Sheets) < 2 {
+		mergeExcelFile.AddSheet("待merge单号")
+	}
 }
 
 func fillFinishMergeList(finishHash []string, commItems []*MergeCommitItem) {
@@ -280,16 +277,6 @@ func fillFinishMergeList(finishHash []string, commItems []*MergeCommitItem) {
 			commitItem.mergedTime = time.Now().Format("2006-01-02 15:04:05")
 		}
 	}
-}
-
-func hashToCommitMsg(commitHash string, commItems []*MergeCommitItem) string {
-	for _, commitItem := range commItems {
-		if commitHash == commitItem.commitHash {
-			return commitItem.commitMsg
-		}
-	}
-
-	return ""
 }
 
 func isMerged(finishHashs []string, hash string) bool {
